@@ -1,0 +1,31 @@
+[package]
+name = "rtsp2browser"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.100"
+bytes = "1.11.0"
+glib = "0.21.4"
+gstreamer = "0.24.3"
+gstreamer-app = "0.24.2"
+gstreamer-rtsp-server = "0.24.2"
+regex = "1.12.2"
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7.17"
+tracing = "0.1.43"
+tracing-subscriber = "0.3.22"
+url = "2.5.7"
+wtransport = { version = "0.6.1", features = ["dangerous-configuration"] }
+
+[[bin]]
+name = "server"
+path = "src/server.rs"
+
+[[bin]]
+name = "client"
+path = "src/client.rs"
+
+[[bin]]
+name = "rtsp-server"
+path = "src/rtsp-server.rs"

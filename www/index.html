@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>RTSP -> WebTransport Video Player</title>
+    <style>
+        body {
+            font-family: system-ui, sans-serif;
+            margin: 1rem;
+        }
+
+        #controls {
+            display: flex;
+            gap: 0.5rem;
+            align-items: center;
+            margin-bottom: 0.5rem
+        }
+
+        #log {
+            font-family: monospace;
+            height: 20em;
+            overflow: auto;
+            border: 1px solid #ddd;
+            padding: 0.5rem
+        }
+
+        canvas {
+            background: black;
+            width: 640px;
+            height: 360px;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>WebTransport H264 Player</h1>
+
+    <div id="controls">
+        <label for="url">Proxy URL</label>
+        <input id="url" type="text" value="https://localhost:4433/" size="30" />
+        <label for="rtspUrl">RTSP URL</label>
+        <input id="rtspUrl" type="text" value="rtsp://127.0.0.1:8554/test" size="30" />
+        <button id="connect">Connect</button>
+    </div>
+
+    <canvas id="canvas" width="640" height="360"></canvas>
+    <!-- <video id="canvas" width="640" height="360"></video> -->
+
+    <h3>Log</h3>
+    <div id="log"></div>
+
+    <script src="client.js"></script>
+</body>
+
+</html>
