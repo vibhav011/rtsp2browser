@@ -155,7 +155,13 @@ class RTSPClient {
         this.url = url;
         this.rtspUrl = rtspUrl;
         this.canvas = canvas;
-        this.ctx = this.canvas.getContext('2d');
+        // this.ctx = this.canvas.getContext('2d');
+        this.gl = this.canvas.getContext('webgl2') || this.canvas.getContext('webgl');
+        if (!this.gl) {
+            log('WebGL not supported', 'error');
+        } else {
+            this.initWebGL();
+        }
 
         this.transport = null;
         this.controlStream = null;
@@ -193,7 +199,10 @@ class RTSPClient {
         // Setup VideoDecoder (will configure later after getting SPS/PPS from SDP)
         this.decoder = new VideoDecoder({
             output: (frame) => {
-                this.ctx.drawImage(frame, 0, 0, this.canvas.width, this.canvas.height);
+                // this.ctx.drawImage(frame, 0, 0, this.canvas.width, this.canvas.height);
+                if (this.gl) {
+                    this.renderFrame(frame);
+                }
                 frame.close();
             },
             error: (e) => log(`Decoder error: ${e}`, 'error')
@@ -213,6 +222,126 @@ class RTSPClient {
         // Start RTSP Handshake
         await this.sendRTSP('OPTIONS', this.rtspUrl);
         await this.sendRTSP('DESCRIBE', this.rtspUrl);
+    }
+
+    initWebGL() {
+        const gl = this.gl;
+
+        // Vertex Shader
+        const vsSource = `
+            attribute vec2 a_position;
+            attribute vec2 a_texCoord;
+            varying vec2 v_texCoord;
+            void main() {
+                gl_Position = vec4(a_position, 0.0, 1.0);
+                v_texCoord = a_texCoord;
+            }
+        `;
+
+        // Fragment Shader
+        const fsSource = `
+            precision mediump float;
+            varying vec2 v_texCoord;
+            uniform sampler2D u_image;
+            void main() {
+                gl_FragColor = texture2D(u_image, v_texCoord);
+            }
+        `;
+
+        // Compile shaders
+        const vs = this.compileShader(gl, gl.VERTEX_SHADER, vsSource);
+        const fs = this.compileShader(gl, gl.FRAGMENT_SHADER, fsSource);
+
+        // Link program
+        this.program = gl.createProgram();
+        gl.attachShader(this.program, vs);
+        gl.attachShader(this.program, fs);
+        gl.linkProgram(this.program);
+
+        if (!gl.getProgramParameter(this.program, gl.LINK_STATUS)) {
+            log('WebGL program link failed: ' + gl.getProgramInfoLog(this.program), 'error');
+            return;
+        }
+
+        gl.useProgram(this.program);
+
+        // Look up locations
+        this.positionLocation = gl.getAttribLocation(this.program, "a_position");
+        this.texCoordLocation = gl.getAttribLocation(this.program, "a_texCoord");
+        this.imageLocation = gl.getUniformLocation(this.program, "u_image");
+
+        // Provide texture coordinates for the rectangle.
+        this.texCoordBuffer = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, this.texCoordBuffer);
+        // Flip Y for WebGL texture coordinates
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+            0.0, 1.0,
+            1.0, 1.0,
+            0.0, 0.0,
+            1.0, 0.0,
+        ]), gl.STATIC_DRAW);
+
+        // Create a buffer to put the vertices in
+        this.positionBuffer = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, this.positionBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+            -1.0, -1.0,
+            1.0, -1.0,
+            -1.0, 1.0,
+            1.0, 1.0,
+        ]), gl.STATIC_DRAW);
+
+        // Create a texture.
+        this.texture = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, this.texture);
+
+        // Set the parameters so we can render any size image.
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    }
+
+    compileShader(gl, type, source) {
+        const shader = gl.createShader(type);
+        gl.shaderSource(shader, source);
+        gl.compileShader(shader);
+        if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+            log('Shader compile failed: ' + gl.getShaderInfoLog(shader), 'error');
+            gl.deleteShader(shader);
+            return null;
+        }
+        return shader;
+    }
+
+    renderFrame(frame) {
+        const gl = this.gl;
+
+        gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
+        gl.clearColor(0, 0, 0, 1);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+
+        gl.useProgram(this.program);
+
+        // Turn on the position attribute
+        gl.enableVertexAttribArray(this.positionLocation);
+        gl.bindBuffer(gl.ARRAY_BUFFER, this.positionBuffer);
+        gl.vertexAttribPointer(this.positionLocation, 2, gl.FLOAT, false, 0, 0);
+
+        // Turn on the texcoord attribute
+        gl.enableVertexAttribArray(this.texCoordLocation);
+        gl.bindBuffer(gl.ARRAY_BUFFER, this.texCoordBuffer);
+        gl.vertexAttribPointer(this.texCoordLocation, 2, gl.FLOAT, false, 0, 0);
+
+        // Bind the texture
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, this.texture);
+
+        // Upload the video frame to the texture
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, frame);
+
+        // Draw the rectangle.
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     }
 
     async sendRTSP(method, url, headers = {}) {
