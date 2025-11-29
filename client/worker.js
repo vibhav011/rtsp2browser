@@ -1,8 +1,17 @@
-
 const LOG_LEVEL = 'info';
 
 function log(msg, level = 'info') {
     postMessage({ type: 'log', msg, level });
+}
+
+function mergeBuffers(bufs) {
+    let merged = new Uint8Array(bufs.reduce((acc, buf) => acc + buf.length, 0));
+    let offset = 0;
+    for (let buf of bufs) {
+        merged.set(buf, offset);
+        offset += buf.length;
+    }
+    return merged;
 }
 
 class H264Depacketizer {
@@ -110,7 +119,7 @@ class H264Depacketizer {
                 // Start of fragment
                 // log(`FU-A/FU-B Start: type ${fuType}, payload size ${payload.length - nal_payload_idx}`);
                 const reconstructedNalHeader = (nal_ref_idc << 5) | fuType;
-                this.fragmentBuffer = [new Uint8Array([reconstructedNalHeader]), payload.subarray(nal_payload_idx)];
+                this.fragmentBuffer = [new Uint8Array([0, 0, 0, 1, reconstructedNalHeader]), payload.subarray(nal_payload_idx)];
                 this.fragmentType = fuType;
                 this.fragmentTimestamp = timestamp; // Store timestamp for this fragment
             } else if (this.fragmentBuffer && this.fragmentType === fuType) {
@@ -119,26 +128,17 @@ class H264Depacketizer {
                 if (e_bit) {
                     // End of fragment
                     // Concatenate
-                    let totalLen = 4; // Start code
-                    for (const chunk of this.fragmentBuffer) totalLen += chunk.length;
+                    const data = mergeBuffers(this.fragmentBuffer);
+                    this.fragmentBuffer = null;
 
                     // Sanity check: ensure fragment is reasonable size
-                    if (totalLen < 20) {
-                        log(`WARNING: Suspiciously small fragmented NAL: ${totalLen} bytes. Discarding.`);
-                        this.fragmentBuffer = null;
+                    if (data.length < 20) {
+                        log(`WARNING: Suspiciously small fragmented NAL: ${data.length} bytes. Discarding.`);
                         return;
                     }
 
                     // log(`FU-A/FU-B End: total size ${totalLen}`);
-                    const data = new Uint8Array(totalLen);
-                    data.set([0, 0, 0, 1], 0);
-                    let offset = 4;
-                    for (const chunk of this.fragmentBuffer) {
-                        data.set(chunk, offset);
-                        offset += chunk.length;
-                    }
                     this.onFrame(data, this.fragmentTimestamp || timestamp);
-                    this.fragmentBuffer = null;
                 }
             } else {
                 // Received middle/end fragment without start - packet loss
@@ -170,6 +170,8 @@ class RTSPClient {
         this.cseq = 1;
         this.decoder = null;
         this.depacketizer = new H264Depacketizer(this.onNalUnit.bind(this));
+        this.NALUnitBuffer = [];
+        this.hasKeyFrame = false;
 
         this.spsPps = null; // Will store SPS/PPS from SDP
         this.streamSPS = null; // Buffer SPS from stream
@@ -178,6 +180,43 @@ class RTSPClient {
         this.videoChannelId = null; // Dynamically assigned by server
         this.profileLevelId = '42001E'; // Default fallback
         this.sentSPSPPS = false; // Track if we've sent SPS/PPS to decoder
+
+        this.isRecording = false;
+        this.recordedChunks = [];
+    }
+
+    startRecording() {
+        this.isRecording = true;
+        this.recordedChunks = [];
+        // If we have SPS/PPS, save them first so the file is playable
+        if (this.spsPps) {
+            // this.spsPps is [0001][SPS][0001][PPS]
+            this.recordedChunks.push(this.spsPps);
+        } else if (this.streamSPS && this.streamPPS) {
+            const sps = new Uint8Array(4 + this.streamSPS.length);
+            sps.set([0, 0, 0, 1], 0);
+            sps.set(this.streamSPS, 4);
+            this.recordedChunks.push(sps);
+
+            const pps = new Uint8Array(4 + this.streamPPS.length);
+            pps.set([0, 0, 0, 1], 0);
+            pps.set(this.streamPPS, 4);
+            this.recordedChunks.push(pps);
+        }
+    }
+
+    stopRecording() {
+        this.isRecording = false;
+        // const totalLength = this.recordedChunks.reduce((acc, chunk) => acc + chunk.length, 0);
+        // const combined = new Uint8Array(totalLength);
+        // let offset = 0;
+        // for (const chunk of this.recordedChunks) {
+        //     combined.set(chunk, offset);
+        //     offset += chunk.length;
+        // }
+        const merged = mergeBuffers(this.recordedChunks);
+        postMessage({ type: 'download', data: merged }, [merged.buffer]);
+        this.recordedChunks = [];
     }
 
     async connect() {
@@ -187,7 +226,7 @@ class RTSPClient {
         const connectionUrl = `${this.url}?rtsp=${encodeURIComponent(this.rtspUrl)}`;
 
         try {
-            const HASH = new Uint8Array([80, 60, 8, 29, 216, 215, 88, 188, 104, 47, 68, 80, 64, 58, 157, 239, 233, 248, 79, 248, 120, 100, 241, 127, 140, 240, 12, 254, 124, 69, 89, 67]);
+            const HASH = new Uint8Array([60, 77, 160, 18, 1, 103, 214, 217, 43, 222, 208, 60, 212, 253, 103, 134, 243, 125, 245, 184, 21, 115, 58, 228, 138, 206, 96, 42, 117, 66, 73, 132]);
             this.transport = new WebTransport(connectionUrl, { serverCertificateHashes: [{ algorithm: "sha-256", value: HASH.buffer }] });
             await this.transport.ready;
             log('WebTransport connected');
@@ -504,98 +543,48 @@ class RTSPClient {
         const nalHeader = data[4];
         const nalType = nalHeader & 0x1F;
 
-        // NAL type 5 = IDR (keyframe), 7 = SPS, 8 = PPS, 6 = SEI
+        // NAL type 5 = IDR (keyframe), 6 = SEI, 7 = SPS, 8 = PPS, 9 = AUD
 
-        // Buffer SPS and PPS when we receive them from the stream
-        if (nalType === 7) {
-            // SPS
-            this.streamSPS = data;
-            // log(`Buffered SPS from stream (${data.length} bytes)`);
-            return; // Don't send SPS alone to decoder yet
-        } else if (nalType === 8) {
-            // PPS
-            this.streamPPS = data;
-            // log(`Buffered PPS from stream (${data.length} bytes)`);
-            return; // Don't send PPS alone to decoder yet
+        // Whether to push the NAL units to decoder
+        // We need to push the whole frame together to the decoder
+        // Receiving an AUD signals start of a new frame
+        let toPush = false;
+
+        if (nalType === 9 && this.NALUnitBuffer.length !== 0) {
+            toPush = true;
         }
-
-        // For IDR frames, prepend buffered SPS/PPS
-        if (nalType === 5) {
-            if (!this.hasSeenKeyFrame) {
-                log(`First keyframe received! NAL size: ${data.length}`);
-                this.hasSeenKeyFrame = true;
-            }
-
-            // Prepend SPS/PPS to EVERY IDR frame
-            // Use stream SPS/PPS if available, otherwise fallback to SDP
-            // Note: this.spsPps from SDP is [start code][SPS][start code][PPS]
-            // We need to extract just the SPS and PPS NAL units from it.
-            let spsToPrepend = this.streamSPS;
-            let ppsToPrepend = this.streamPPS;
-
-            if (!spsToPrepend && this.spsPps) {
-                // Extract SPS from this.spsPps (assuming it's [0001][SPS][0001][PPS])
-                let spsStart = 4;
-                let spsEnd = -1;
-                for (let i = spsStart; i < this.spsPps.length - 3; i++) {
-                    if (this.spsPps[i] === 0 && this.spsPps[i + 1] === 0 && this.spsPps[i + 2] === 0 && this.spsPps[i + 3] === 1) {
-                        spsEnd = i;
-                        break;
-                    }
-                }
-                if (spsEnd !== -1) {
-                    spsToPrepend = this.spsPps.subarray(spsStart, spsEnd);
-                }
-            }
-
-            if (!ppsToPrepend && this.spsPps) {
-                // Extract PPS from this.spsPps
-                let ppsStart = -1;
-                for (let i = 0; i < this.spsPps.length - 3; i++) {
-                    if (this.spsPps[i] === 0 && this.spsPps[i + 1] === 0 && this.spsPps[i + 2] === 0 && this.spsPps[i + 3] === 1) {
-                        if (ppsStart === -1) { // Found first start code (SPS)
-                            ppsStart = i + 4; // PPS starts after this start code
-                        } else { // Found second start code (PPS)
-                            ppsStart = i + 4; // PPS starts after this start code
-                            break;
-                        }
-                    }
-                }
-                if (ppsStart !== -1) {
-                    ppsToPrepend = this.spsPps.subarray(ppsStart);
-                }
-            }
-
-            if (spsToPrepend && ppsToPrepend) {
-                const combinedData = new Uint8Array(spsToPrepend.length + ppsToPrepend.length + data.length);
-                combinedData.set(spsToPrepend, 0);
-                combinedData.set(ppsToPrepend, spsToPrepend.length);
-                combinedData.set(data, spsToPrepend.length + ppsToPrepend.length);
-                data = combinedData;
-                // log(`Prepended SPS+PPS to IDR frame. Total size: ${data.length}`);
-            } else {
-                log('WARNING: No SPS/PPS available for IDR frame. Skipping this frame.', 'error');
-                return; // Skip IDR if we don't have SPS/PPS
-            }
+        else if (nalType === 5) {
+            this.hasKeyFrame = true;
+            this.hasSeenKeyFrame = true;
         }
+        this.NALUnitBuffer.push(data);
 
         // Skip all frames until we see the first keyframe
         if (!this.hasSeenKeyFrame) {
             log(`Skipping NAL type ${nalType} - waiting for keyframe`);
             return;
         }
+        if (!toPush) return;
 
-        // Mark IDR frames as keyframes, everything else as delta
-        const frameType = (nalType === 5) ? 'key' : 'delta';
+        // Mark IDR containing frames as keyframes, everything else as delta
+        const frameType = this.hasKeyFrame ? 'key' : 'delta';
+        const mergedData = mergeBuffers(this.NALUnitBuffer);
+        this.NALUnitBuffer = [];
+        this.hasKeyFrame = false;
 
         // We need to convert RTP timestamp to microseconds for EncodedVideoChunk
         // H.264 usually 90000 Hz clock.
         const timestampUs = (timestamp / 90000) * 1_000_000;
 
+        if (this.isRecording) {
+            this.recordedChunks.push(new Uint8Array(mergedData));
+        }
+
         const chunk = new EncodedVideoChunk({
             type: frameType,
             timestamp: timestampUs,
-            data: data
+            data: mergedData,
+            transfer: [mergedData.buffer]
         });
 
         try {
@@ -609,7 +598,11 @@ class RTSPClient {
 self.onmessage = (e) => {
     const { type, url, rtspUrl, canvas } = e.data;
     if (type === 'init') {
-        const client = new RTSPClient(url, rtspUrl, canvas);
-        client.connect();
+        self.client = new RTSPClient(url, rtspUrl, canvas);
+        self.client.connect();
+    } else if (type === 'startRecording') {
+        if (self.client) self.client.startRecording();
+    } else if (type === 'stopRecording') {
+        if (self.client) self.client.stopRecording();
     }
 };

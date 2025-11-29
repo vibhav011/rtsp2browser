@@ -22,11 +22,11 @@ fn main() {
         speed-preset=veryfast \
         key-int-max=0 \
         byte-stream=true \
-        aud=false \
+        aud=true \
         sliced-threads=true \
         intra-refresh=false ! \
         video/x-h264,profile=baseline ! \
-        rtph264pay config-interval=0 mtu=1200 auto-header-extension=false \
+        rtph264pay config-interval=0 mtu=1000 auto-header-extension=false \
         timestamp-offset=0 name=pay0 pt=96 )");
     factory.set_shared(true); // Allow multiple clients to connect
 

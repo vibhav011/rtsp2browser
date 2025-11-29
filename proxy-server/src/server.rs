@@ -14,8 +14,8 @@ async fn main() -> Result<()> {
     // Initialize logging
     tracing_subscriber::fmt::init();
 
-    let cert_pemfile = "./cert.pem";
-    let private_key_pemfile = "./key.pem";
+    let cert_pemfile = "./DO_NOT_USE_CERT.pem";
+    let private_key_pemfile = "./DO_NOT_USE_KEY.pem";
     
     // Check if certs exist, otherwise generate self-signed (for dev)
     let identity = if std::path::Path::new(cert_pemfile).exists() {

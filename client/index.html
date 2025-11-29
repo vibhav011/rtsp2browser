@@ -39,10 +39,14 @@
 
     <div id="controls">
         <label for="url">Proxy URL</label>
-        <input id="url" type="text" value="https://localhost:4433/" size="30" />
+        <input id="url" type="text" value="https://127.0.0.1:4433/" size="30" />
         <label for="rtspUrl">RTSP URL</label>
         <input id="rtspUrl" type="text" value="rtsp://127.0.0.1:8554/test" size="30" />
-        <button id="connect">Connect</button>
+        <div class="controls">
+            <button id="connect">Connect</button>
+            <button id="startRecord">Start Recording</button>
+            <button id="stopRecord" disabled>Stop & Download</button>
+        </div>
     </div>
 
     <canvas id="canvas" width="640" height="360"></canvas>
