@@ -17,7 +17,7 @@ fn main() {
 
     // Create a media factory
     let factory = gst_rtsp_server::RTSPMediaFactory::new();
-    factory.set_launch("( avfvideosrc ! \
+    factory.set_launch("( videotestsrc ! \
         x264enc tune=zerolatency \
         speed-preset=veryfast \
         key-int-max=0 \

@@ -173,13 +173,9 @@ class RTSPClient {
         this.NALUnitBuffer = [];
         this.hasKeyFrame = false;
 
-        this.spsPps = null; // Will store SPS/PPS from SDP
-        this.streamSPS = null; // Buffer SPS from stream
-        this.streamPPS = null; // Buffer PPS from stream
         this.hasSeenKeyFrame = false; // Track if we've seen a keyframe
         this.videoChannelId = null; // Dynamically assigned by server
         this.profileLevelId = '42001E'; // Default fallback
-        this.sentSPSPPS = false; // Track if we've sent SPS/PPS to decoder
 
         this.isRecording = false;
         this.recordedChunks = [];
@@ -188,32 +184,10 @@ class RTSPClient {
     startRecording() {
         this.isRecording = true;
         this.recordedChunks = [];
-        // If we have SPS/PPS, save them first so the file is playable
-        if (this.spsPps) {
-            // this.spsPps is [0001][SPS][0001][PPS]
-            this.recordedChunks.push(this.spsPps);
-        } else if (this.streamSPS && this.streamPPS) {
-            const sps = new Uint8Array(4 + this.streamSPS.length);
-            sps.set([0, 0, 0, 1], 0);
-            sps.set(this.streamSPS, 4);
-            this.recordedChunks.push(sps);
-
-            const pps = new Uint8Array(4 + this.streamPPS.length);
-            pps.set([0, 0, 0, 1], 0);
-            pps.set(this.streamPPS, 4);
-            this.recordedChunks.push(pps);
-        }
     }
 
     stopRecording() {
         this.isRecording = false;
-        // const totalLength = this.recordedChunks.reduce((acc, chunk) => acc + chunk.length, 0);
-        // const combined = new Uint8Array(totalLength);
-        // let offset = 0;
-        // for (const chunk of this.recordedChunks) {
-        //     combined.set(chunk, offset);
-        //     offset += chunk.length;
-        // }
         const merged = mergeBuffers(this.recordedChunks);
         postMessage({ type: 'download', data: merged }, [merged.buffer]);
         this.recordedChunks = [];
