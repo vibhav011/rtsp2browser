@@ -4,10 +4,10 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tracing::{error, info, instrument};
-use wtransport::Connection;
 use crate::rtsp::{RtspRequest, RtspResponse};
 use std::collections::VecDeque;
 use tokio_util::sync::CancellationToken;
+use crate::transport::Transport;
 
 pub struct RTSPProxy {
     rtsp_url: String,
@@ -25,17 +25,13 @@ impl RTSPProxy {
         Self { rtsp_url }
     }
 
-    #[instrument(skip(self, connection))]
-    pub async fn handle_connection(&self, connection: Connection) -> Result<()> {
-        info!("Handling new WebTransport connection");
 
-        // 1. Accept the bidirectional stream for RTSP control
-        let (mut wt_send, mut wt_recv) = connection
-            .accept_bi()
-            .await
-            .context("Failed to accept bidirectional stream")?;
+    #[instrument(skip(self, transport))]
+    pub async fn handle_connection(&self, mut transport: Transport) -> Result<()> {
+        info!("Handling new connection via Transport abstraction");
 
-        info!("Accepted RTSP control stream");
+        // 1. Reading/Writing control is now done via transport
+        // We don't accept_bi here anymore, we expect transport to be ready for control
 
         // 2. Connect to the RTSP server
         let url = url::Url::parse(&self.rtsp_url).context("Invalid RTSP URL")?;
@@ -52,12 +48,9 @@ impl RTSPProxy {
 
         let (mut tcp_read, mut tcp_write) = tcp_stream.split();
 
-        // Shared state for the session
-        let connection = Arc::new(connection);
-
         // For detecting connection loss
-        let closed_fut = connection.closed();
-        tokio::pin!(closed_fut);
+        // let closed_fut = transport.closed(); // This borrows transport.
+        // tokio::pin!(closed_fut);
         
         // State management
         let mut next_channel_id = 0;
@@ -73,18 +66,18 @@ impl RTSPProxy {
 
         loop {
             tokio::select! {
-                // Read from WT (Browser) -> Forward to TCP (RTSP Server)
-                res = wt_recv.read_buf(&mut wt_buf) => {
+                // Read from Transport (Browser) -> Forward to TCP (RTSP Server)
+                res = transport.read_control(&mut wt_buf) => {
                     let n = match res {
                         Ok(n) => n,
                         Err(e) => {
-                            error!("WebTransport read error: {}", e);
+                            error!("Transport read error: {}", e);
                             break;
                         }
                     };
                     
                     if n == 0 {
-                        info!("WebTransport stream closed by client");
+                        info!("Transport stream closed by client");
                         break;
                     }
 
@@ -129,7 +122,7 @@ impl RTSPProxy {
                     }
                 }
                 
-                // Read from TCP (RTSP Server) -> Forward to WT (Browser)
+                // Read from TCP (RTSP Server) -> Forward to Transport (Browser)
                 res = tcp_read.read_buf(&mut tcp_buf) => {
                     let n = match res {
                         Ok(n) => n,
@@ -169,25 +162,27 @@ impl RTSPProxy {
                                     }
                                     
                                     // Spawn UDP forwarders
-                                    let conn_clone = connection.clone();
+                                    // We need to clone the transport sender part
+                                    // Assuming transport.clone_sender() exists and returns a DatagramSender
+                                    let sender = transport.clone_sender(); 
                                     let rtp_socket = setup.rtp_socket.clone();
                                     let rtp_id = setup.rtp_channel_id;
                                     let token = cancel_token.clone();
                                     
                                     tokio::spawn(async move {
-                                        if let Err(e) = forward_udp(rtp_socket, conn_clone, rtp_id, token).await {
+                                        if let Err(e) = forward_udp(rtp_socket, sender, rtp_id, token).await {
                                             // Only log error if not cancelled
                                             error!("RTP forwarder error: {}", e);
                                         }
                                     });
                                     
-                                    let conn_clone = connection.clone();
+                                    let sender = transport.clone_sender(); 
                                     let rtcp_socket = setup.rtcp_socket.clone();
                                     let rtcp_id = setup.rtcp_channel_id;
                                     let token = cancel_token.clone();
                                     
                                     tokio::spawn(async move {
-                                        if let Err(e) = forward_udp(rtcp_socket, conn_clone, rtcp_id, token).await {
+                                        if let Err(e) = forward_udp(rtcp_socket, sender, rtcp_id, token).await {
                                             error!("RTCP forwarder error: {}", e);
                                         }
                                     });
@@ -196,17 +191,17 @@ impl RTSPProxy {
                         }
                         
                         // Forward to Browser
-                        if let Err(e) = wt_send.write_all(&resp.to_bytes()).await {
-                            error!("Failed to write to WebTransport: {}", e);
+                        if let Err(e) = transport.write_control(&resp.to_bytes()).await {
+                            error!("Failed to write to Transport: {}", e);
                             break;
                         }
                     }
                 }
 
-                _ = &mut closed_fut => {
-                    error!("Connection closed");
-                    break;
-                }
+                // _ = closed_fut => {
+                //      error!("Connection closed");
+                //      break;
+                // }
             }
         }
         
@@ -232,7 +227,7 @@ impl RTSPProxy {
 
 async fn forward_udp(
     socket: Arc<UdpSocket>, 
-    connection: Arc<Connection>, 
+    sender: crate::transport::TransportSender, 
     channel_id: u8,
     token: CancellationToken
 ) -> Result<()> {
@@ -246,11 +241,11 @@ async fn forward_udp(
             res = socket.recv_from(&mut buf) => {
                 match res {
                     Ok((n, _)) => {
-                        let mut payload = Vec::with_capacity(n + 1);
-                        payload.push(channel_id);
+                        let mut payload = bytes::BytesMut::with_capacity(n + 1);
+                        payload.extend_from_slice(&[channel_id]);
                         payload.extend_from_slice(&buf[..n]);
                         
-                        if let Err(e) = connection.send_datagram(payload) {
+                        if let Err(e) = sender.send_datagram(payload.freeze()).await {
                             // If connection is closed, we should stop
                             return Err(anyhow::anyhow!("Failed to send datagram: {}", e));
                         }

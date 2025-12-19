@@ -14,6 +14,122 @@ function mergeBuffers(bufs) {
     return merged;
 }
 
+class WebTransportAdapter {
+    constructor(url, hash) {
+        this.transport = new WebTransport(url, {
+            serverCertificateHashes: hash ? [{ algorithm: "sha-256", value: hash.buffer }] : undefined
+        });
+        this.ready = this.transport.ready;
+        this.datagrams = this.transport.datagrams;
+    }
+
+    async createBidirectionalStream() {
+        return this.transport.createBidirectionalStream();
+    }
+
+    close() {
+        this.transport.close();
+    }
+}
+
+class WebSocketAdapter {
+    constructor(url) {
+        // url includes query params like ?rtsp=...
+        // We need to append session_id and type.
+
+        // Generate random session ID
+        const sessionId = Math.random().toString(36).substring(2, 15);
+
+        // Helper to add params
+        const createUrl = (type) => {
+            const u = new URL(url);
+            u.searchParams.set('session_id', sessionId);
+            u.searchParams.set('type', type);
+            return u.toString();
+        };
+
+        const controlUrl = createUrl('control'); // Contains rtsp param from original url
+        const dataUrl = createUrl('data');       // Contains rtsp param too (ignored by server for data, but harmless)
+
+        log(`Connecting WS Control: ${controlUrl}`);
+        log(`Connecting WS Data: ${dataUrl}`);
+
+        this.wsControl = new WebSocket(controlUrl);
+        this.wsData = new WebSocket(dataUrl);
+        this.wsData.binaryType = 'arraybuffer';
+
+        this.ready = Promise.all([
+            new Promise((resolve, reject) => {
+                this.wsControl.onopen = () => resolve();
+                this.wsControl.onerror = (e) => reject(e);
+            }),
+            new Promise((resolve, reject) => {
+                this.wsData.onopen = () => resolve();
+                this.wsData.onerror = (e) => reject(e);
+            })
+        ]);
+
+        // Control Stream Readable
+        let controlController;
+        this.controlReadable = new ReadableStream({
+            start(controller) { controlController = controller; }
+        });
+
+        // Datagram Stream Readable
+        let datagramController;
+        this.datagrams = {
+            readable: new ReadableStream({
+                start(controller) { datagramController = controller; }
+            })
+        };
+
+        // Handle Control Messages (Text)
+        this.wsControl.onmessage = (event) => {
+            if (typeof event.data === 'string') {
+                if (controlController) {
+                    controlController.enqueue(new TextEncoder().encode(event.data));
+                }
+            } else {
+                log('Received binary on Control socket (unexpected)', 'warn');
+            }
+        };
+
+        // Handle Data Messages (Binary)
+        this.wsData.onmessage = (event) => {
+            if (typeof event.data !== 'string') {
+                if (datagramController) {
+                    datagramController.enqueue(new Uint8Array(event.data));
+                }
+            } else {
+                log('Received text on Data socket (unexpected)', 'warn');
+            }
+        };
+
+        this.wsControl.onclose = () => log('WS Control closed');
+        this.wsData.onclose = () => log('WS Data closed');
+    }
+
+    async createBidirectionalStream() {
+        // Return wrapper for Control Socket
+        const self = this;
+        return {
+            readable: self.controlReadable,
+            writable: new WritableStream({
+                write(chunk) {
+                    // chunk is Uint8Array (from TextEncoder in sendRTSP)
+                    const text = new TextDecoder().decode(chunk);
+                    self.wsControl.send(text);
+                }
+            })
+        };
+    }
+
+    close() {
+        this.wsControl.close();
+        this.wsData.close();
+    }
+}
+
 class H264Depacketizer {
     constructor(onFrame) {
         this.onFrame = onFrame;
@@ -200,13 +316,36 @@ class RTSPClient {
         const connectionUrl = `${this.url}?rtsp=${encodeURIComponent(this.rtspUrl)}`;
 
         try {
-            const HASH = new Uint8Array([60, 77, 160, 18, 1, 103, 214, 217, 43, 222, 208, 60, 212, 253, 103, 134, 243, 125, 245, 184, 21, 115, 58, 228, 138, 206, 96, 42, 117, 66, 73, 132]);
-            this.transport = new WebTransport(connectionUrl, { serverCertificateHashes: [{ algorithm: "sha-256", value: HASH.buffer }] });
-            await this.transport.ready;
-            log('WebTransport connected');
+            if (typeof WebTransport !== 'undefined') {
+                log(`Attempting WebTransport connection to ${connectionUrl}...`);
+                const HASH = new Uint8Array([100, 233, 92, 176, 89, 220, 118, 78, 143, 217, 157, 67, 70, 118, 9, 150, 159, 234, 192, 32, 47, 142, 83, 198, 41, 23, 11, 252, 150, 115, 233, 137]);
+                this.transport = new WebTransportAdapter(connectionUrl, HASH);
+                await this.transport.ready;
+                log('WebTransport connected');
+            } else {
+                throw new Error("WebTransport not supported");
+            }
         } catch (e) {
-            log(`Connection failed: ${e}`, 'error');
-            return;
+            log(`WebTransport failed: ${e}. Fallback to WebSocket...`, 'warn');
+
+            // Rewrite URL for WebSocket (4433 -> 8080)
+            // Force insecure WS (plain TCP) as our server logic for 8080 is not TLS-enabled
+            try {
+                const u = new URL(connectionUrl);
+                if (u.port === '4433') {
+                    u.port = '8080';
+                }
+                u.protocol = 'ws:';
+
+                const wsUrl = u.toString();
+
+                this.transport = new WebSocketAdapter(wsUrl);
+                await this.transport.ready;
+                log(`WebSocket connected to ${wsUrl}`);
+            } catch (wsErr) {
+                log(`WebSocket connection failed: ${wsErr}`, 'error');
+                return;
+            }
         }
 
         // Setup VideoDecoder (will configure later after getting SPS/PPS from SDP)

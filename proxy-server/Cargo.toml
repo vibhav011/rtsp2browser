@@ -17,14 +17,12 @@ tracing = "0.1.43"
 tracing-subscriber = "0.3.22"
 url = "2.5.7"
 wtransport = { version = "0.6.1", features = ["dangerous-configuration"] }
+tokio-tungstenite = "0.24.0"
+futures-util = "0.3.31"
 
 [[bin]]
 name = "server"
 path = "src/server.rs"
-
-[[bin]]
-name = "client"
-path = "src/client.rs"
 
 [[bin]]
 name = "rtsp-server"
